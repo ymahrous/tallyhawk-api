@@ -25,9 +25,9 @@ structlog.configure(
         structlog.processors.add_log_level,
         structlog.processors.JSONRenderer()
     ])
-logger = structlog.get_logger("edocai.api")
+logger = structlog.get_logger("tallyhawk.api")
 
-app = FastAPI(title="edocAI API")
+app = FastAPI(title="Tallyhawk API")
 
 allowed_origins_str = os.getenv("ALLOWED_ORIGINS")
 origins = [origin.strip() for origin in allowed_origins_str.split(",") if origin.strip()]
@@ -45,7 +45,7 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     database.init_db()
-    logger.info("edocAI API started successfully.")
+    logger.info("Tallyhawk API started successfully.")
 
 app.include_router(auth_router)
 app.include_router(admin_router)

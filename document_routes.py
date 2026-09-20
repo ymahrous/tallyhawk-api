@@ -203,14 +203,19 @@ def get_tax_summary(
             else:
                 # Fallback for legacy extractions AND stale (pre-currency-change) rows.
                 # Report the ORIGINAL extracted amount/currency rather than mislabeling
-                # a stale converted_amount as the current base_currency.
+                # a stale converted_amount as the current base_currency. There is no
+                # valid converted-to-base-currency figure for these rows, so `amount`
+                # is left as None rather than fabricated from the raw (original-currency)
+                # total — it must never be summed into `summary` or displayed as if it
+                # were in current_user.base_currency.
                 raw_amount = str(ext.extracted_data.get("total_amount", "0"))
                 clean_amount = re.sub(r'[^\d\.-]', '', raw_amount)
-                amount = float(clean_amount) if clean_amount else 0.0
-                original_amount = ext.original_amount if ext.original_amount is not None else amount
+                parsed_amount = float(clean_amount) if clean_amount else 0.0
+                amount = None
+                original_amount = ext.original_amount if ext.original_amount is not None else parsed_amount
                 original_currency = ext.original_currency if ext.original_currency else current_user.base_currency
 
-            if stale_conversion or ext.converted_amount is None:
+            if amount is None:
                 needs_reconversion.append({
                     "date": raw_date,
                     "vendor": ext.extracted_data.get("vendor", ""),
@@ -235,11 +240,13 @@ def get_tax_summary(
     output = io.StringIO()
     writer = csv.writer(output)
 
-    # Enhanced header with currency info
-    first_currency = detail_rows[0]['original_currency'] if detail_rows else 'N/A'
+    # Original currency varies per row (each document keeps its own extracted
+    # currency), so it must be its own column rather than folded into a single
+    # header derived from one row — a single header would mislabel every row
+    # that wasn't in that one row's currency.
     writer.writerow([
         "Date", "Vendor", "Category",
-        f"Original Amount ({first_currency})",
+        "Original Amount", "Original Currency",
         f"Converted Amount ({current_user.base_currency})",
         "Exchange Rate"
     ])
@@ -250,7 +257,8 @@ def get_tax_summary(
             row["vendor"],
             row["category"],
             f"{row['original_amount']:,.2f}",
-            f"{row['converted_amount']:,.2f}",
+            row["original_currency"],
+            f"{row['converted_amount']:,.2f}" if row["converted_amount"] is not None else "N/A",
             f"{row['exchange_rate']:.6f}" if row['exchange_rate'] else "N/A"
         ])
 
@@ -274,5 +282,5 @@ def get_tax_summary(
     return StreamingResponse(
         output,
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=edocAI_Tax_Summary_{year}.csv"}
+        headers={"Content-Disposition": f"attachment; filename=Tallyhawk_Tax_Summary_{year}.csv"}
     )

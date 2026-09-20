@@ -4,7 +4,7 @@ from sqlmodel import select
 
 def test_signup(client):
     response = client.post("/api/v1/auth/signup", json={
-        "username": "testuser@edocai.com",
+        "username": "testuser@tallyhawk.com",
         "password": "password123"
     })
     assert response.status_code == 201

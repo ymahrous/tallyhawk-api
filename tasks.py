@@ -1,9 +1,9 @@
 import ai_extractor
 from database import engine
-from typing import List
-from sqlmodel import Session
+from typing import List, Optional
+from sqlmodel import Session, select
 from celery_app import celery_app
-from models import Document, Extraction
+from models import Document, Extraction, User
 from detection import check_for_duplicates
 from vendor.vendor_utils import match_or_create_vendor
 import httpx
@@ -15,18 +15,23 @@ import asyncio
 EXCHANGE_RATE_API_KEY = os.getenv("EXCHANGE_RATE_API_KEY")
 EXCHANGE_RATE_BASE_URL = "https://v6.exchangerate-api.com/v6"
 
-async def convert_currency(amount: float, from_currency: str, to_currency: str) -> tuple[float, float]:
+async def convert_currency(amount: float, from_currency: str, to_currency: str) -> tuple[float, Optional[float]]:
     """
     Convert amount from one currency to another.
-    Returns: (converted_amount, exchange_rate)
+    Returns: (converted_amount, exchange_rate). exchange_rate is None when no
+    real conversion happened (missing API key, or the API call failed) — as
+    opposed to the same-currency case below, where 1.0 is a genuine rate, not
+    a fallback. Callers MUST treat rate=None as "not converted" and must not
+    persist the returned amount as if it were actually in `to_currency`: a
+    fabricated 1.0 rate would be indistinguishable from a real 1:1 conversion
+    and would silently mislabel an unconverted amount as converted.
     """
     if from_currency == to_currency:
         return amount, 1.0
 
     if not EXCHANGE_RATE_API_KEY:
-        # Fallback: return original amount if no API key
-        print("⚠️ No EXCHANGE_RATE_API_KEY set, skipping conversion")
-        return amount, 1.0
+        print("⚠️ No EXCHANGE_RATE_API_KEY set, cannot convert")
+        return amount, None
 
     url = f"{EXCHANGE_RATE_BASE_URL}/{EXCHANGE_RATE_API_KEY}/pair/{from_currency}/{to_currency}/{amount}"
 
@@ -42,10 +47,10 @@ async def convert_currency(amount: float, from_currency: str, to_currency: str) 
                 return float(converted), float(rate)
             else:
                 print(f"⚠️ Exchange rate API error: {data.get('error-type', 'unknown')}")
-                return amount, 1.0
+                return amount, None
         except Exception as e:
             print(f"⚠️ Currency conversion failed: {e}")
-            return amount, 1.0
+            return amount, None
 
 
 @celery_app.task
@@ -58,7 +63,6 @@ def process_document_task(document_id: str):
             return {"error": "Document not found"}
 
         # Get user's base currency
-        from models import User
         user = session.get(User, document.owner_id)
         base_currency = user.base_currency if user else "USD"
 
@@ -87,6 +91,21 @@ def process_document_task(document_id: str):
                 convert_currency(original_amount, original_currency, base_currency)
             )
 
+            if exchange_rate is not None:
+                stored_converted_amount = round(converted_amount, 2)
+                stored_converted_currency = base_currency
+                stored_exchange_rate = round(exchange_rate, 6)
+            else:
+                # Conversion unavailable right now (no API key / API failure).
+                # Leave these unset like a legacy row rather than claiming the
+                # raw amount is in base_currency — every downstream "reliable"
+                # check (detection.py, stats/analytics, tax summary) already
+                # knows how to exclude/flag a row with no converted_amount,
+                # and reconvert_user_extractions() will pick it up on retry.
+                stored_converted_amount = None
+                stored_converted_currency = None
+                stored_exchange_rate = None
+
             # --- NEW: Vendor Intelligence Matching ---
             vendor_id = None
             raw_vendor_name = extracted_data.get("vendor") # Adjust this key if your Gemini prompt outputs something like "vendor_name"
@@ -107,9 +126,9 @@ def process_document_task(document_id: str):
                 # Store currency fields
                 original_currency=original_currency,
                 original_amount=original_amount,
-                converted_amount=round(converted_amount, 2),
-                converted_currency=base_currency,  # snapshot what currency converted_amount is actually in
-                exchange_rate=round(exchange_rate, 6)
+                converted_amount=stored_converted_amount,
+                converted_currency=stored_converted_currency,  # snapshot what currency converted_amount is actually in
+                exchange_rate=stored_exchange_rate
             )
             session.add(extraction)
 
@@ -117,13 +136,14 @@ def process_document_task(document_id: str):
             session.add(document)
             session.commit()
 
-            if extracted_data.get("vendor"):
+            if extracted_data.get("vendor") and stored_converted_amount is not None:
                 flags = check_for_duplicates(
                     current_user_id=document.owner_id,
                     extraction_data=extracted_data,
                     current_doc_id=document.id,
                     session=session,
-                    current_amount=round(converted_amount, 2)
+                    current_amount=stored_converted_amount,
+                    base_currency=base_currency
                 )
 
                 if flags:
@@ -140,3 +160,75 @@ def process_document_task(document_id: str):
             session.commit()
             print(f"❌ Failed to process document: {e}")
             return {"status": "failed", "error": str(e)}
+
+
+def reconvert_user_extractions(session: Session, user_id: str, base_currency: str) -> int:
+    """Re-converts every one of this user's Extraction rows into `base_currency`,
+    in place. This is what keeps invoices, dashboard totals, analytics, and tax
+    summaries from drifting out of sync after a user changes base_currency —
+    without it, converted_amount/converted_currency stay pinned to whatever
+    currency was active when each document was originally processed.
+
+    Only rows with a known original_amount/original_currency can be
+    reconverted; legacy rows predating multi-currency support (both fields
+    None) have no source amount to convert from and are left untouched — see
+    the "Legacy extractions" note in README.md.
+
+    Groups rows by original_currency so each distinct currency pair costs one
+    exchange-rate API lookup, no matter how many documents share it. Returns
+    the number of rows updated.
+    """
+    rows = session.exec(
+        select(Extraction)
+        .join(Document, Extraction.document_id == Document.id)
+        .where(Document.owner_id == user_id)
+        .where(Document.status == "COMPLETED")
+        .where(Extraction.original_amount.is_not(None))
+        .where(Extraction.original_currency.is_not(None))
+    ).all()
+
+    by_currency: dict[str, list[Extraction]] = {}
+    for ext in rows:
+        if ext.converted_currency == base_currency:
+            continue  # already converted into the currency we want
+        by_currency.setdefault(ext.original_currency, []).append(ext)
+
+    updated = 0
+    for original_currency, exts in by_currency.items():
+        _, rate = asyncio.run(convert_currency(1.0, original_currency, base_currency))
+        if rate is None:
+            # Conversion unavailable right now (no API key / API failure).
+            # Leave these rows untouched rather than writing a fabricated
+            # rate — they stay correctly flagged as stale/unreliable (their
+            # converted_currency still doesn't match base_currency) and will
+            # be retried the next time this runs.
+            print(f"⚠️ Skipping reconversion of {len(exts)} row(s) from {original_currency} — no rate available")
+            continue
+        for ext in exts:
+            ext.converted_amount = round(ext.original_amount * rate, 2)
+            ext.converted_currency = base_currency
+            ext.exchange_rate = round(rate, 6)
+            session.add(ext)
+            updated += 1
+
+    if updated:
+        session.commit()
+
+    return updated
+
+
+@celery_app.task
+def reconvert_user_currency_task(user_id: str):
+    """Triggered whenever a user changes base_currency (see the PATCH
+    /api/v1/auth/settings handler in auth_routes.py). Re-reads base_currency
+    from the DB at execution time rather than trusting a value the caller
+    passed in, so repeated/rapid currency changes still converge to whatever
+    it is *right now* instead of racing an earlier task."""
+    with Session(engine) as session:
+        user = session.get(User, user_id)
+        if not user:
+            return {"error": "User not found"}
+
+        updated = reconvert_user_extractions(session, user_id, user.base_currency)
+        print(f"🔁 Reconverted {updated} extraction(s) for user {user_id} to {user.base_currency}")
+        return {"status": "success", "user_id": user_id, "updated": updated}

@@ -8,6 +8,7 @@ from sqlmodel import Session, select
 from datetime import datetime, timezone
 from typing import Optional
 from dependencies import get_current_user
+from tasks import reconvert_user_currency_task
 from fastapi import APIRouter, HTTPException, Depends, status, Body
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
@@ -158,18 +159,18 @@ def forgot_password(email: str = Body(..., embed=True)):
         
         # --- SEND EMAIL VIA RESEND ---
         resend.api_key = os.getenv("RESEND_API_KEY")
-        mail_from = os.getenv("MAIL_FROM", "edocAI <onboarding@resend.dev>")
-        
+        mail_from = os.getenv("MAIL_FROM", "Tallyhawk <onboarding@resend.dev>")
+
         try:
             resend.Emails.send({
                 "from": mail_from,
                 "to": [email],
-                "subject": "Reset your edocAI password",
+                "subject": "Reset your Tallyhawk password",
                 "html": f"""
                     <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
                         <h2 style="color: #111;">Reset your password</h2>
                         <p style="color: #555; font-size: 16px; line-height: 1.5;">
-                            We received a request to reset your password for your edocAI account. 
+                            We received a request to reset your password for your Tallyhawk account.
                             Click the button below to choose a new one:
                         </p>
                         <div style="margin: 30px 0;">
@@ -254,10 +255,20 @@ def update_settings(
 ):
     """Update user settings (currently only base_currency)."""
     if settings.base_currency is not None:
-        user.base_currency = settings.base_currency.upper()
+        new_currency = settings.base_currency.upper()
+        currency_changed = new_currency != user.base_currency
+
+        user.base_currency = new_currency
         session.add(user)
         session.commit()
         session.refresh(user)
+
+        if currency_changed:
+            # Re-convert every existing document into the new base_currency so
+            # invoices, dashboard totals, analytics, and tax summaries don't
+            # keep showing amounts denominated in the currency the user just
+            # left (see tasks.reconvert_user_currency_task).
+            reconvert_user_currency_task.delay(user.id)
 
     return UserSettingsRead(
         id=user.id,

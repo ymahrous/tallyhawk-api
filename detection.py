@@ -1,28 +1,23 @@
-import re
 import models
+from typing import Optional
 from sqlmodel import Session, select
 from datetime import datetime, timedelta
 
 
-def _effective_amount(ext: models.Extraction) -> float:
-    """Compare documents in a common currency wherever possible. Prefer the
-    persisted converted_amount (it's in *some* base_currency snapshot); only
-    fall back to the raw extracted string for legacy rows with no conversion
-    at all. This does not fully solve cross-currency comparisons when
-    converted_currency differs between rows, but it is far closer to correct
-    than comparing raw original-currency strings directly, which is what the
-    previous implementation did."""
-    if ext.converted_amount is not None:
+def _effective_amount(ext: models.Extraction, base_currency: str) -> Optional[float]:
+    """Returns ext's amount in `base_currency`, or None if it can't be reliably
+    compared against `current_amount` (also in `base_currency`). Only trusts
+    converted_amount when it was actually converted into the CALLER'S CURRENT
+    base_currency — otherwise it's in some other currency (original extracted
+    currency, or a stale base_currency from before the user changed their
+    setting) and must not be compared as if it were. Mirrors the is_reliable
+    pattern in stats_routes.py / analytics_routes.py."""
+    if ext.converted_amount is not None and ext.converted_currency == base_currency:
         return ext.converted_amount
-    raw = str(ext.extracted_data.get("total_amount", "0"))
-    clean = re.sub(r'[^\d\.-]', '', raw)
-    try:
-        return float(clean)
-    except ValueError:
-        return 0.0
+    return None
 
 
-def check_for_duplicates(current_user_id: str, extraction_data: dict, current_doc_id: str, session: Session, current_amount: float) -> list[str]:
+def check_for_duplicates(current_user_id: str, extraction_data: dict, current_doc_id: str, session: Session, current_amount: float, base_currency: str) -> list[str]:
     flags = []
 
     vendor = extraction_data.get("vendor", "")
@@ -45,7 +40,9 @@ def check_for_duplicates(current_user_id: str, extraction_data: dict, current_do
 
     for doc, ext in existing_docs:
         ext_vendor = str(ext.extracted_data.get("vendor", "")).lower()
-        ext_amount = _effective_amount(ext)  # NEW: was raw extracted_data total_amount
+        ext_amount = _effective_amount(ext, base_currency)
+        if ext_amount is None:
+            continue  # different/stale currency — not safely comparable
 
         # DEBUG PRINTS
         print(f"--- Comparing Docs ---")
@@ -75,7 +72,9 @@ def check_for_duplicates(current_user_id: str, extraction_data: dict, current_do
     for ext in all_vendor_docs:
         ext_vendor = str(ext.extracted_data.get("vendor", "")).lower()
         if vendor.lower() in ext_vendor or ext_vendor in vendor.lower():
-            vendor_amounts.append(_effective_amount(ext))  # NEW: was raw extracted_data total_amount
+            ext_amount = _effective_amount(ext, base_currency)
+            if ext_amount is not None:
+                vendor_amounts.append(ext_amount)
 
     if len(vendor_amounts) >= 2: # Need at least 2 past purchases to establish a pattern
         avg_amount = sum(vendor_amounts) / len(vendor_amounts)

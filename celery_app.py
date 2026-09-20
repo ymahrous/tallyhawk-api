@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 celery_app = Celery(
-    "extractiq_worker",
+    "tallyhawk_worker",
     broker=f"rediss://default:{os.getenv('UPSTASH_REDIS_PASSWORD')}@{os.getenv('UPSTASH_REDIS_ENDPOINT')}",
     include=['tasks'] 
 )

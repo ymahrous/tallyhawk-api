@@ -1,4 +1,4 @@
-# Contributing to edocAI Backend
+# Contributing to Tallyhawk
 
 Thank you for your interest in contributing. This guide reflects the current FastAPI backend, Celery worker, and test workflow in this repository.
 
@@ -8,7 +8,7 @@ Thank you for your interest in contributing. This guide reflects the current Fas
 
 | Item | Details |
 |---|---|
-| Repository | `edocAI-backend` |
+| Repository | `tallyhawk-api` |
 | Primary stack | FastAPI, Celery, SQLModel, pytest |
 | Local API | `uvicorn main:app --reload` |
 | Local worker | `celery -A celery_app.celery_app worker --loglevel=info` |
@@ -18,7 +18,7 @@ Thank you for your interest in contributing. This guide reflects the current Fas
 
 ## Table of Contents
 
-- [Contributing to edocAI Backend](#contributing-to-edocai-backend)
+- [Contributing to Tallyhawk](#contributing-to-tallyhawk)
   - [At a Glance](#at-a-glance)
   - [Table of Contents](#table-of-contents)
   - [Code of Conduct](#code-of-conduct)
@@ -51,8 +51,8 @@ This project follows a simple rule: be respectful. Constructive criticism is wel
 1. Fork the repository.
 2. Clone your fork locally:
    ```bash
-   git clone https://github.com/your-username/edocai-backend.git
-   cd edocai-backend
+   git clone https://github.com/your-username/tallyhawk-api.git
+   cd tallyhawk-api
    ```
 3. Create and activate a virtual environment:
    ```bash

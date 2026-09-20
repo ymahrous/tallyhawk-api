@@ -1,4 +1,4 @@
-# edocAI SaaS Plan — Phase 0 Decisions
+# Tallyhawk SaaS Plan — Phase 0 Decisions
 
 ## Payment Provider
 Stripe — chosen for built-in subscription management, webhooks, and a
